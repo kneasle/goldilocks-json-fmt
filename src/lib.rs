@@ -37,15 +37,6 @@ struct Node<'source> {
     kind: NodeKind<'source>,
 }
 
-impl<'source> Node<'source> {
-    fn new_atom(s: &'source str) -> Self {
-        Self {
-            unsplit_width: s.len(),
-            kind: NodeKind::Atom(s),
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum NodeKind<'source> {
     /// A JSON value that cannot be reformatted (number, string, null, true, false).  For the
@@ -53,9 +44,18 @@ enum NodeKind<'source> {
     Atom(&'source str),
     /// A JSON array
     Array(Vec<Node<'source>>),
-    /// A JSON object.  Each element in the [`Vec`] is a `(key, value)` pair, and `key` is required
-    /// to be a string.
-    Object(Vec<(Node<'source>, Node<'source>)>),
+    /// A JSON object.  Each element in the [`Vec`] is a `(key, value)` pair, and `key` is a string
+    /// atom.
+    Object(Vec<(&'source str, Node<'source>)>),
+}
+
+impl<'source> Node<'source> {
+    fn new_atom(s: &'source str) -> Self {
+        Self {
+            unsplit_width: s.len(),
+            kind: NodeKind::Atom(s),
+        }
+    }
 }
 
 /////////////
@@ -144,6 +144,8 @@ mod parsing {
                     'n' => expect_ident!(4 => 'u', 'l', 'l'),
                     't' => expect_ident!(4 => 'r', 'u', 'e'),
                     'f' => expect_ident!(5 => 'a', 'l', 's', 'e'),
+                    ']' => return Some(ValueParseResult::CloseSquare),
+                    '}' => return Some(ValueParseResult::CloseBrace),
                     _ => return None, // No other chars are a valid start to a JSON value
                 };
                 // If a JSON value was successfully parsed, return that value
@@ -155,7 +157,47 @@ mod parsing {
         /// Attempt to parse the chars in `iter` as an array, **assuming that the initial `[` has
         /// been consumed**.
         fn parse_array(iter: &mut Iter<'source>) -> Option<Self> {
-            todo!()
+            // Parse the first element
+            match Self::parse_value(iter)? {
+                // Found one value, so parse the others
+                ValueParseResult::Node(n) => {
+                    // Found one value, so parse the others
+                    let mut unsplit_width = "[".len() + n.unsplit_width + "]".len();
+                    let mut contents = vec![n];
+                    // Repeatedly expect either:
+                    // - ',' followed by another element, or
+                    // - ']', finishing the array
+                    while let Some((_, c)) = iter.next() {
+                        match c {
+                            ' ' | '\t' | '\n' | '\r' => continue, // Ignore whitespace
+                            ']' => {
+                                // Finish the array
+                                return Some(Node {
+                                    unsplit_width,
+                                    kind: NodeKind::Array(contents),
+                                });
+                            }
+                            ',' => {
+                                // Parse another element, before looking for ',' or ']' again
+                                if let Some(ValueParseResult::Node(n)) = Self::parse_value(iter) {
+                                    unsplit_width += ", ".len() + n.unsplit_width;
+                                    contents.push(n);
+                                } else {
+                                    return None; // If we didn't parse a value, then error
+                                }
+                            }
+                            _ => return None, // No other chars are allowed
+                        }
+                    }
+                    None // It's an error for the string to finish during an array
+                }
+                // Array is `[]`, and therefore empty
+                ValueParseResult::CloseSquare => Some(Node {
+                    unsplit_width: "[]".len(),
+                    kind: NodeKind::Array(vec![]),
+                }),
+                ValueParseResult::CloseBrace => None, // Can't end an array with `}`
+            }
         }
 
         /// Attempt to parse the chars in `iter` as an object, **assuming that the initial `{` has
@@ -260,6 +302,11 @@ mod parsing {
             check_atom(s, s);
         }
 
+        #[track_caller]
+        fn check_ok(s: &str, exp_node: Node) {
+            assert_eq!(Node::parse(s), Some(exp_node));
+        }
+
         #[test]
         fn fails() {
             check_fail("]");
@@ -302,6 +349,59 @@ mod parsing {
             check_fail("    \"\n\"  x");
             check_fail("    \"\t\"  x");
             check_fail(r#"    "string"  x"#); // Check for things in trailing ws
+        }
+
+        #[test]
+        fn array() {
+            check_ok(
+                "[]",
+                Node {
+                    unsplit_width: 2,
+                    kind: NodeKind::Array(vec![]),
+                },
+            );
+            check_ok(
+                "    [  ]\r\t  \n",
+                Node {
+                    unsplit_width: 2,
+                    kind: NodeKind::Array(vec![]),
+                },
+            );
+            check_fail("    [  }\r\t  \n");
+            check_ok(
+                "    [ true ]\r\t  \n",
+                Node {
+                    unsplit_width: 6,
+                    kind: NodeKind::Array(vec![Node::new_atom("true")]),
+                },
+            );
+            check_fail("    [ true, ]\r\t  \n");
+            check_ok(
+                "    [ true, false ]\r\t  \n",
+                Node {
+                    unsplit_width: 13,
+                    kind: NodeKind::Array(vec![Node::new_atom("true"), Node::new_atom("false")]),
+                },
+            );
+            check_ok(
+                "    [ true, [\n\nfalse, []] ]\r\t  \n",
+                Node {
+                    unsplit_width: "[true, [false, []]]".len(),
+                    kind: NodeKind::Array(vec![
+                        Node::new_atom("true"),
+                        Node {
+                            unsplit_width: "[false, []]".len(),
+                            kind: NodeKind::Array(vec![
+                                Node::new_atom("false"),
+                                Node {
+                                    unsplit_width: 2,
+                                    kind: NodeKind::Array(vec![]),
+                                },
+                            ]),
+                        },
+                    ]),
+                },
+            );
         }
     }
 }
