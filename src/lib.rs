@@ -30,14 +30,14 @@ impl Default for Config {
 /////////
 
 /// An element in an AST
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Node<'source> {
     /// The width of this node if it were to be 'unsplit' - i.e. all on one line
     unsplit_width: usize,
     kind: NodeKind<'source>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NodeKind<'source> {
     /// A JSON value that cannot be reformatted (number, string, null, true, false).  For the
     /// purposes of an autoformatter, these are perfectly equivalent
@@ -132,7 +132,7 @@ mod parsing {
                     ' ' | '\t' | '\n' | '\r' => continue, // Ignore whitespace
                     '[' => Self::parse_array(iter)?,
                     '{' => Self::parse_object(iter)?,
-                    '"' => Self::parse_string(start_idx, iter)?,
+                    '"' => Node::new_atom(Self::parse_string(start_idx, iter)?),
                     '-' => {
                         // If a '-' is reached, it must be followed by a digit then a number
                         // without the leading digit
@@ -159,7 +159,6 @@ mod parsing {
         fn parse_array(iter: &mut Iter<'source>) -> Option<Self> {
             // Parse the first element
             match Self::parse_value(iter)? {
-                // Found one value, so parse the others
                 ValueParseResult::Node(n) => {
                     // Found one value, so parse the others
                     let mut unsplit_width = "[".len() + n.unsplit_width + "]".len();
@@ -203,17 +202,69 @@ mod parsing {
         /// Attempt to parse the chars in `iter` as an object, **assuming that the initial `{` has
         /// been consumed**.
         fn parse_object(iter: &mut Iter<'source>) -> Option<Self> {
-            todo!()
+            let mut fields = Vec::<(&str, Node)>::new();
+            let mut unsplit_width = "{ ".len() + " }".len();
+            loop {
+                // Parse ws until we get to a '"' for the key (returning if we see '}' and this is
+                // the first field)
+                let key = loop {
+                    let (start_idx, c) = iter.next()?;
+                    match c {
+                        ' ' | '\t' | '\n' | '\r' => continue, // Ignore whitespace
+                        '"' => break Self::parse_string(start_idx, iter)?,
+                        '}' if fields.is_empty() => {
+                            // '}' before the first key is an empty object
+                            // TODO: Report idempotence bug
+                            return Some(Node {
+                                unsplit_width: 2, // "{}"
+                                kind: NodeKind::Object(vec![]),
+                            });
+                        }
+                        _ => return None, // Any other char is an error
+                    }
+                };
+                // Read whitespace until we find a ':'
+                loop {
+                    match iter.next()?.1 {
+                        ' ' | '\t' | '\n' | '\r' => continue,
+                        ':' => break,     // ':' means we parse the key
+                        _ => return None, // Anything other than ':' or whitespace is an error
+                    }
+                }
+                // Parse the contained value
+                let value = match Self::parse_value(iter) {
+                    Some(ValueParseResult::Node(n)) => n,
+                    _ => return None,
+                };
+                // Add the field we just parsed
+                unsplit_width += key.len() + ": ".len() + value.unsplit_width;
+                fields.push((key, value));
+                // Consume either ',' (parse next key/value pair) or '}' (end object)
+                loop {
+                    match iter.next()?.1 {
+                        ' ' | '\t' | '\n' | '\r' => continue,
+                        ',' => break, // if ',', parse the next key/value pair
+                        '}' => {
+                            return Some(Node {
+                                unsplit_width,
+                                kind: NodeKind::Object(fields),
+                            });
+                        }
+                        _ => return None, // Any other char is an error
+                    }
+                }
+                unsplit_width += ", ".len(); // Add space required by the comma
+            }
         }
 
         /// Attempt to parse the chars in `iter` as an string, **assuming that the initial `"` has
         /// been consumed**.
-        fn parse_string(start_idx: usize, iter: &mut Iter<'source>) -> Option<Self> {
+        fn parse_string(start_idx: usize, iter: &mut Iter<'source>) -> Option<&'source str> {
             while let Some((idx, c)) = iter.next() {
                 match c {
                     // If we find an unescaped quote, then terminate the string.
                     // `+ 1` is OK because '"' has UTF-8 length of 1 byte
-                    '"' => return Some(Node::new_atom(&iter.source[start_idx..idx + 1])),
+                    '"' => return Some(&iter.source[start_idx..idx + 1]),
                     '\\' => match iter.next()?.1 {
                         '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {} // Valid escape chars
                         'u' => {
@@ -401,6 +452,97 @@ mod parsing {
                         },
                     ]),
                 },
+            );
+        }
+
+        #[test]
+        fn object() {
+            check_ok(
+                "{}",
+                Node {
+                    unsplit_width: "{}".len(),
+                    kind: NodeKind::Object(vec![]),
+                },
+            );
+            check_ok(
+                "  {\t \t \n\n    }    \t\t\n   ",
+                Node {
+                    unsplit_width: "{}".len(),
+                    kind: NodeKind::Object(vec![]),
+                },
+            );
+            check_ok(
+                r#"{"key": "value"}"#,
+                Node {
+                    unsplit_width: r#"{ "key": "value" }"#.len(),
+                    kind: NodeKind::Object(vec![("\"key\"", Node::new_atom("\"value\""))]),
+                },
+            );
+            check_ok(
+                r#"{"key": "value", "key2": "value2"}"#,
+                Node {
+                    unsplit_width: r#"{ "key": "value", "key2": "value2" }"#.len(),
+                    kind: NodeKind::Object(vec![
+                        ("\"key\"", Node::new_atom("\"value\"")),
+                        ("\"key2\"", Node::new_atom("\"value2\"")),
+                    ]),
+                },
+            );
+            check_ok(
+                "  {\t \t \n\n \"key\"  \t:\n\n \"value\"  \t\n  }    \t\t\n   ",
+                Node {
+                    unsplit_width: r#"{ "key": "value" }"#.len(),
+                    kind: NodeKind::Object(vec![("\"key\"", Node::new_atom("\"value\""))]),
+                },
+            );
+            check_ok(
+                "  {\t \t \n\n \"key\"  \t:\n\n [   \"value\" \t ]  \t\n  }    \t\t\n   ",
+                Node {
+                    unsplit_width: r#"{ "key": ["value"] }"#.len(),
+                    kind: NodeKind::Object(vec![(
+                        "\"key\"",
+                        Node {
+                            unsplit_width: r#"["value"]"#.len(),
+                            kind: NodeKind::Array(vec![Node::new_atom("\"value\"")]),
+                        },
+                    )]),
+                },
+            );
+
+            let phat_node = Node {
+                unsplit_width: r#"{ "key": "value", "key2": [{ "is_open": true }, { "is_open": false }, null] }"#.len(),
+                kind: NodeKind::Object(vec![
+                    ("\"key\"", Node::new_atom("\"value\"")),
+                    ("\"key2\"", Node {
+                        unsplit_width: r#"[{ "is_open": true }, { "is_open": false }, null]"#.len(),
+                        kind: NodeKind::Array(vec![
+                            Node {
+                                unsplit_width: r#"{ "is_open": true }"#.len(),
+                                kind: NodeKind::Object(vec![
+                                    ("\"is_open\"", Node::new_atom("true"))
+                                ]),
+                            },
+                            Node {
+                                unsplit_width: r#"{ "is_open": false }"#.len(),
+                                kind: NodeKind::Object(vec![
+                                    ("\"is_open\"", Node::new_atom("false"))
+                                ]),
+                            },
+                            Node::new_atom("null")
+                        ])
+                    })
+                ]),
+            };
+            check_ok(
+                r#"{"key": "value", "key2": [{ "is_open": true }, { "is_open": false }, null ] }"#,
+                phat_node.clone(),
+            );
+            check_ok(
+                "  {\t \t \n\n \"key\"  \t:\n\n \"value\"  \t\n
+                \t\t\r,
+                \"key2\": [  { \"is_open\": true }, { \"is_open\"  \t: false }, null ]
+                }    \t\t\n   ",
+                phat_node,
             );
         }
     }
