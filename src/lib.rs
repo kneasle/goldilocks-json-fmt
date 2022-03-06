@@ -37,6 +37,15 @@ struct Node<'source> {
     kind: NodeKind<'source>,
 }
 
+impl<'source> Node<'source> {
+    fn new_atom(s: &'source str) -> Self {
+        Self {
+            unsplit_width: s.len(),
+            kind: NodeKind::Atom(s),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum NodeKind<'source> {
     /// A JSON value that cannot be reformatted (number, string, null, true, false).  For the
@@ -68,6 +77,9 @@ mod parsing {
     /// Consume the next character of `$iter`, assuming it matches a `$pattern`.
     macro_rules! expect_char_pattern {
         ($iter: expr, $pattern: pat) => {
+            // If the pattern contains '|', then we're forced to put brackets round the pattern,
+            // which unnecessarily trips this lint
+            #[allow(unused_parens)]
             match $iter.next() {
                 Some((_idx, $pattern)) => (),
                 _ => return None,
@@ -132,7 +144,7 @@ mod parsing {
                     'n' => expect_ident!(4 => 'u', 'l', 'l'),
                     't' => expect_ident!(4 => 'r', 'u', 'e'),
                     'f' => expect_ident!(5 => 'a', 'l', 's', 'e'),
-                    _ => return None, // Any other chars would violate the JSON spec
+                    _ => return None, // No other chars are a valid start to a JSON value
                 };
                 // If a JSON value was successfully parsed, return that value
                 return Some(ValueParseResult::Node(value_node));
@@ -155,7 +167,26 @@ mod parsing {
         /// Attempt to parse the chars in `iter` as an string, **assuming that the initial `"` has
         /// been consumed**.
         fn parse_string(start_idx: usize, iter: &mut Iter<'source>) -> Option<Self> {
-            todo!()
+            while let Some((idx, c)) = iter.next() {
+                match c {
+                    // If we find an unescaped quote, then terminate the string.
+                    // `+ 1` is OK because '"' has UTF-8 length of 1 byte
+                    '"' => return Some(Node::new_atom(&iter.source[start_idx..idx + 1])),
+                    '\\' => match iter.next()?.1 {
+                        '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {} // Valid escape chars
+                        'u' => {
+                            // `\u` should be followed by 4 hex chars
+                            for _ in 0..4 {
+                                expect_char_pattern!(iter, ('0'..='9' | 'a'..='f' | 'A'..='F'));
+                            }
+                        }
+                        _ => return None, // Invalid escape sequence
+                    },
+                    '\0'..='\x19' => return None, // Control chars aren't allowed in strings
+                    _ => {}                       // Any other char is just part of the string
+                }
+            }
+            None // If a file ended during a string, then that's an error
         }
 
         /// Parse a number, **assuming that the first digit has been consumed**
@@ -213,6 +244,22 @@ mod parsing {
             assert_eq!(Node::parse(s), None,);
         }
 
+        #[track_caller]
+        fn check_atom(s: &str, literal: &str) {
+            assert_eq!(
+                Node::parse(s).expect("Parsing atom unexpectedly failed"),
+                Node {
+                    unsplit_width: literal.len(),
+                    kind: NodeKind::Atom(literal),
+                }
+            );
+        }
+
+        #[track_caller]
+        fn check_atom_no_ws(s: &str) {
+            check_atom(s, s);
+        }
+
         #[test]
         fn fails() {
             check_fail("]");
@@ -223,23 +270,38 @@ mod parsing {
 
         #[test]
         fn literal() {
-            #[track_caller]
-            fn check(s: &str, literal: &str) {
-                assert_eq!(
-                    Node::parse(s).unwrap(),
-                    Node {
-                        unsplit_width: literal.len(),
-                        kind: NodeKind::Atom(literal),
-                    }
-                );
-            }
-
-            check("true", "true");
-            check("false", "false");
-            check("null", "null");
-            check("    null", "null");
-            check("    null\t\n  ", "null");
+            check_atom_no_ws("true");
+            check_atom_no_ws("false");
+            check_atom_no_ws("null");
+            check_atom("    null", "null");
+            check_atom("    null\t\n  ", "null");
             check_fail("    null  x"); // Check for things in trailing ws
+        }
+
+        #[test]
+        fn string() {
+            check_atom_no_ws(r#""""#);
+            // Escape sequences
+            check_atom_no_ws(r#""thing \" thing""#);
+            check_atom_no_ws(r#""thing \\ thing""#);
+            check_atom_no_ws(r#""thing \\""#);
+            check_atom_no_ws(r#""thing \"  \\""#);
+            check_atom_no_ws(r#""thing \/ thing""#);
+            check_atom_no_ws(r#""thing \uAFFF thing""#);
+            check_atom_no_ws(r#""thing \u01aF thing""#);
+            // Invalid escape
+            check_fail(r#""thing \x thing""#);
+            check_fail(r#""thing \uAFXF thing""#);
+            // Leading/trailing whitespace
+            check_atom("\r   \"\"", r#""""#);
+            check_atom("\"\"  \r\t  \n  ", r#""""#);
+            check_atom("\r   \"\"  \r\t  \n  ", r#""""#);
+            check_atom("\r   \"string\"  \r\t  \n  ", r#""string""#);
+            // Control chars in a string aren't allowed
+            check_fail("    \"\0\"  x");
+            check_fail("    \"\n\"  x");
+            check_fail("    \"\t\"  x");
+            check_fail(r#"    "string"  x"#); // Check for things in trailing ws
         }
     }
 }
