@@ -133,14 +133,17 @@ mod parsing {
                     '[' => Self::parse_array(iter)?,
                     '{' => Self::parse_object(iter)?,
                     '"' => Node::new_atom(Self::parse_string(start_idx, iter)?),
-                    '-' => {
-                        // If a '-' is reached, it must be followed by a digit then a number
-                        // without the leading digit
-                        expect_char_pattern!(iter, '0'..='9');
-                        Self::parse_number_after_first_digit(start_idx, iter)?
-                    }
-                    // TODO: Handle the fact that leading 0s aren't allowed
-                    '0'..='9' => Self::parse_number_after_first_digit(start_idx, iter)?,
+                    // If a '-' is reached, it must be followed by a digit then a number without
+                    // the leading digit
+                    '-' => match iter.next() {
+                        Some((_, '0')) => Self::parse_number_after_leading_0(start_idx, iter)?,
+                        Some((_, '1'..='9')) => {
+                            Self::parse_number_after_first_non_zero(start_idx, iter)?
+                        }
+                        _ => return None, // '-' must be followed by [0-9]
+                    },
+                    '0' => Self::parse_number_after_leading_0(start_idx, iter)?,
+                    '1'..='9' => Self::parse_number_after_first_non_zero(start_idx, iter)?,
                     'n' => expect_ident!(4 => 'u', 'l', 'l'),
                     't' => expect_ident!(4 => 'r', 'u', 'e'),
                     'f' => expect_ident!(5 => 'a', 'l', 's', 'e'),
@@ -282,12 +285,102 @@ mod parsing {
             None // If a file ended during a string, then that's an error
         }
 
-        /// Parse a number, **assuming that the first digit has been consumed**
-        fn parse_number_after_first_digit(
+        /// Parse a number, assuming that the leading 0 has been consumed (i.e. the number so far
+        /// is `0` or `-0`)
+        fn parse_number_after_leading_0(
             start_idx: usize,
             iter: &mut Iter<'source>,
         ) -> Option<Self> {
-            todo!()
+            Some(match iter.peek_char() {
+                Some('1'..='9') => return None, // Leading 0
+                Some('.') => {
+                    iter.next();
+                    Self::parse_number_after_decimal_point(start_idx, iter)?
+                }
+                Some('e' | 'E') => {
+                    iter.next();
+                    Self::parse_number_after_exponent(start_idx, iter)?
+                }
+                // Number is '0' or '-0'.  Therefore, the peeked char is part of the next token
+                // (e.g. it could be a ',')
+                _ => iter.new_atom_starting_from(start_idx),
+            })
+        }
+
+        /// Parse a number, assuming that a single non-zero digit has been consumed (i.e. the
+        /// number so far matches `[1-9]` or `-[1-9]`
+        fn parse_number_after_first_non_zero(
+            start_idx: usize,
+            iter: &mut Iter<'source>,
+        ) -> Option<Self> {
+            // TODO: Refactor all these functions into one loop?
+            loop {
+                match iter.peek_char() {
+                    Some('0'..='9') => {
+                        iter.next(); // Keep consuming numbers
+                    }
+                    Some('.') => {
+                        iter.next();
+                        return Self::parse_number_after_decimal_point(start_idx, iter);
+                    }
+                    Some('e' | 'E') => {
+                        iter.next();
+                        return Self::parse_number_after_exponent(start_idx, iter);
+                    }
+                    // Anything that isn't part of a number belongs to the next token (e.g. ',' to
+                    // move onto the next array element)
+                    _ => return Some(iter.new_atom_starting_from(start_idx)),
+                }
+            }
+        }
+
+        /// Parse a number, assuming that everything up to **and including** the decimal point has
+        /// been consumed.
+        fn parse_number_after_decimal_point(
+            start_idx: usize,
+            iter: &mut Iter<'source>,
+        ) -> Option<Self> {
+            loop {
+                match iter.peek_char() {
+                    Some('0'..='9') => {
+                        iter.next(); // Keep consuming numbers
+                    }
+                    Some('.') => return None, // Can't have multiple decimal points
+                    Some('e' | 'E') => {
+                        iter.next(); // Consume the 'e'/'E'
+                        return Self::parse_number_after_exponent(start_idx, iter);
+                    }
+                    // Anything that isn't part of a number belongs to the next token (e.g. ',' to
+                    // move onto the next array element)
+                    _ => return Some(iter.new_atom_starting_from(start_idx)),
+                }
+            }
+        }
+
+        /// Parse a number, assuming that everything up to **and including** the 'e' or 'E' has been
+        /// consumed
+        fn parse_number_after_exponent(start_idx: usize, iter: &mut Iter<'source>) -> Option<Self> {
+            // An exponent can optionally start with a '+' or '-'
+            if let Some('+' | '-') = iter.peek_char() {
+                iter.next(); // Consume the '+/-' if it exists, otherwise start parsing digits
+            }
+
+            let mut has_at_least_one_digit = false;
+            loop {
+                match iter.peek_char() {
+                    Some('0'..='9') => iter.next(), // Numbers are always valid exponents
+                    Some('.') => return None,       // Can't have decimal exponents
+                    Some('e' | 'E') => return None, // Can't have multiple exponents
+                    Some('+' | '-') => return None, // Can't have '+' or '-' in the middle of an exponent
+                    // Anything that isn't part of a number belongs to the next token (e.g. ',' to
+                    // move onto the next array element)
+                    _ => match has_at_least_one_digit {
+                        true => return Some(iter.new_atom_starting_from(start_idx)),
+                        false => return None,
+                    },
+                };
+                has_at_least_one_digit = true;
+            }
         }
     }
 
@@ -307,8 +400,12 @@ mod parsing {
             }
         }
 
-        fn substr_from_start(&mut self, start_idx: usize) -> &'source str {
-            &self.source[start_idx..self.peek_idx()]
+        fn peek_char(&mut self) -> Option<char> {
+            self.inner.peek().map(|(_idx, c)| *c)
+        }
+
+        fn new_atom_starting_from(&mut self, start_idx: usize) -> Node<'source> {
+            Node::new_atom(&self.source[start_idx..self.peek_idx()])
         }
 
         /// Gets the byte index of the next char to be popped (or the source's length if no chars
@@ -400,6 +497,28 @@ mod parsing {
             check_fail("    \"\n\"  x");
             check_fail("    \"\t\"  x");
             check_fail(r#"    "string"  x"#); // Check for things in trailing ws
+        }
+
+        #[test]
+        fn number() {
+            check_atom_no_ws("0");
+            check_atom_no_ws("-0");
+            check_atom("   0   \t\n ", "0");
+            check_fail("02");
+            check_fail("-02");
+            check_atom_no_ws("10233415216992347901");
+            check_atom_no_ws("0.2");
+            check_fail("0.2.3");
+            check_atom_no_ws("-0.00002");
+            check_atom_no_ws("0.0200000");
+            check_atom_no_ws("0.02e1");
+            check_atom_no_ws("0.02E-1201");
+            check_atom_no_ws("0.02e-1201");
+            check_atom_no_ws("0.02e+01201");
+            check_fail("0.02e");
+            check_fail("0.02e-");
+            check_atom_no_ws("0e-01"); // Leading 0s in exponents is apparently allowed?
+            check_atom_no_ws("0e01"); // Leading 0s in exponents is apparently allowed?
         }
 
         #[test]
