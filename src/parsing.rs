@@ -620,4 +620,148 @@ mod test {
             phat_node,
         );
     }
+
+    #[test]
+    fn json_check_fail() {
+        // These tests are taken from JSON_checker's test suite, found here:
+        // http://www.json.org/JSON_checker/ (the tests themselves are here:
+        // http://www.json.org/JSON_checker/test.zip).
+        //
+        // Note:
+        // - fail1.json was removed because top-level types other than object or array were allowed
+        //   after RFC7159 (https://www.ietf.org/rfc/rfc7159.txt)
+        // - fail18.json was removed because JSON doesn't have a depth limit
+
+        check_fail(r#"["Unclosed array""#); // fail2.json
+        check_fail(r#"{unquoted_key: "keys must be quoted"}"#); // fail3.json
+        check_fail(r#"["extra comma",]"#); // fail4.json
+        check_fail(r#"["double extra comma",,]"#); // fail5.json
+        check_fail(r#"[   , "<-- missing value"]"#); // fail6.json
+        check_fail(r#"["Comma after the close"],"#); // fail7.json
+        check_fail(r#"["Extra close"]]"#); // fail8.json
+        check_fail(r#"{"Extra comma": true,}"#); // fail9.json
+
+        check_fail(r#"{"Extra value after close": true} "misplaced quoted value""#); // fail10.json
+        check_fail(r#"{"Illegal expression": 1 + 2}"#); // fail11.json
+        check_fail(r#"{"Illegal invocation": alert()}"#); // fail12.json
+        check_fail(r#"{"Numbers cannot have leading zeroes": 013}"#); // fail13.json
+        check_fail(r#"{"Numbers cannot be hex": 0x14}"#); // fail14.json
+        check_fail(r#"["Illegal backslash escape: \x15"]"#); // fail15.json
+        check_fail(r#"[\naked]"#); // fail16.json
+        check_fail(r#"["Illegal backslash escape: \017"]"#); // fail17.json
+        check_fail(r#"{"Missing colon" null}"#); // fail19.json
+
+        check_fail(r#"{"Double colon":: null}"#); // fail20.json
+        check_fail(r#"{"Comma instead of colon", null}"#); // fail21.json
+        check_fail(r#"["Colon instead of comma": false]"#); // fail22.json
+        check_fail(r#"["Bad value", truth]"#); // fail23.json
+        check_fail(r#"['single quote']"#); // fail24.json
+        check_fail(r#"["	tab	character	in	string	"]"#); // fail25.json
+        check_fail(r#"["tab\   character\   in\  string\  "]"#); // fail26.json
+        check_fail(
+            r#"["line
+break"]"#,
+        ); // fail27.json
+        check_fail(
+            r#"["line\
+break"]"#,
+        ); // fail28.json
+        check_fail(r#"[0e]"#); // fail29.json
+
+        check_fail(r#"[0e+]"#); // fail30.json
+        check_fail(r#"[0e+-1]"#); // fail31.json
+        check_fail(r#"{"Comma instead if closing brace": true,"#); // fail32.json
+        check_fail(r#"["mismatch"}"#); // fail33.json
+    }
+
+    #[test]
+    fn json_check_ok() {
+        check_ok(
+            r#"{
+    "JSON Test Pattern pass3": {
+        "The outermost value": "must be an object or array.",
+        "In this test": "It is an object."
+    }
+}
+"#,
+            Node {
+                unsplit_width: 123,
+                kind: NodeKind::Object(vec![(
+                    "\"JSON Test Pattern pass3\"",
+                    Node {
+                        unsplit_width: 92,
+                        kind: NodeKind::Object(vec![
+                            (
+                                "\"The outermost value\"",
+                                Node::new_atom("\"must be an object or array.\""),
+                            ),
+                            ("\"In this test\"", Node::new_atom("\"It is an object.\"")),
+                        ]),
+                    },
+                )]),
+            },
+        ); // pass3.json
+
+        assert!(Node::parse(
+            r#"[
+    "JSON Test Pattern pass1",
+    {"object with 1 member":["array with 1 element"]},
+    {},
+    [],
+    -42,
+    true,
+    false,
+    null,
+    {
+        "integer": 1234567890,
+        "real": -9876.543210,
+        "e": 0.123456789e-12,
+        "E": 1.234567890E+34,
+        "":  23456789012E66,
+        "zero": 0,
+        "one": 1,
+        "space": " ",
+        "quote": "\"",
+        "backslash": "\\",
+        "controls": "\b\f\n\r\t",
+        "slash": "/ & \/",
+        "alpha": "abcdefghijklmnopqrstuvwyz",
+        "ALPHA": "ABCDEFGHIJKLMNOPQRSTUVWYZ",
+        "digit": "0123456789",
+        "0123456789": "digit",
+        "special": "`1~!@#$%^&*()_+-={':[,]}|;.</>?",
+        "hex": "\u0123\u4567\u89AB\uCDEF\uabcd\uef4A",
+        "true": true,
+        "false": false,
+        "null": null,
+        "array":[  ],
+        "object":{  },
+        "address": "50 St. James Street",
+        "url": "http://www.JSON.org/",
+        "comment": "// /* <!-- --",
+        "\\# -- --> */\n    ": " ",
+    " s p a c e d " :[1,2 , 3
+
+,
+
+4 , 5        ,          6           ,7        ],"compact":[1,2,3,4,5,6,7],
+        "jsontext": "{\"object with 1 member\":[\"array with 1 element\"]}",
+        "quotes": "&#34; \u0022 %22 0x22 034 &#x22;",
+        "\/\\\"\uCAFE\uBABE\uAB98\uFCDE\ubcda\uef4A\b\f\n\r\t`1~!@#$%^&*()_+-=[]{}|;:',./<>?"
+: "A key can be any string"
+    },
+    0.5 ,98.6
+,
+99.44
+,
+
+1066,
+1e1,
+0.1e1,
+1e-1,
+1e00,2e+00,2e-00
+,"rosebud"]"#,
+        )
+        .is_some()); // pass1.json
+    }
 }
