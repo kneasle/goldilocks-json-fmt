@@ -1,4 +1,4 @@
-//! # fast-json-fmt
+//! # goldilocks-json-fmt
 //!
 //! A fast, simple, opinionated JSON formatter.
 
