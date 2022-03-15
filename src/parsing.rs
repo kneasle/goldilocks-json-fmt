@@ -1,68 +1,124 @@
 //! Code to parse JSON string into an AST
 
-use crate::{Node, NodeKind};
-
-/// The result generated when a JSON value is parsed.  Special cases are made for ']' and '}' to
-/// prevent lookahead for empty arrays/objects.
-enum ValueParseResult<'source> {
-    /// The value parsed to a node
-    Node(Node<'source>),
-    /// The first non-whitespace char was `']'`
-    CloseSquare,
-    /// The first non-whitespace char was `'}'`
-    CloseBrace,
-}
-
-/// Consume the next character of `$iter`, assuming it matches a `$pattern`.
-macro_rules! expect_char_pattern {
-    ($iter: expr, $pattern: pat) => {
-        // If the pattern contains '|', then we're forced to put brackets round the pattern,
-        // which unnecessarily trips this lint
-        #[allow(unused_parens)]
-        match $iter.next() {
-            Some((_idx, $pattern)) => (),
-            _ => return None,
-        }
-    };
-}
+use crate::{Node, NodeKind, Result};
 
 impl<'source> Node<'source> {
     /// Parse a [`str`]ing into a JSON node
-    pub(crate) fn parse(s: &'source str) -> Option<Self> {
+    pub(crate) fn parse(s: &'source str) -> Result<Self> {
         let mut iter = Iter::new(s);
         // Parse the JSON value as the root node
-        let ast_root = match parse_value(&mut iter) {
-            Some(ValueParseResult::Node(n)) => n,
-            _ => return None, // If we're parsing a JSON string, then anything other than an
-                              // JSON value isn't valid
-        };
+        let ast_root = parse_value(Item::TopLevelValue, &mut iter)?;
         // Assert that there's only whitespace until the end of the file
         loop {
             match iter.next() {
                 Some((_, ' ' | '\r' | '\n' | '\t')) => continue, // Consume any whitespace
-                Some(_) => return None, // Anything other than whitespace is an error
-                None => return Some(ast_root), // EOF with only whitespace is fine
+                // Anything other than whitespace is an error
+                Some((idx, c)) => return Err(Error::InvalidTrailingWhitespace(idx, c)),
+                None => return Ok(ast_root), // EOF with only whitespace is fine
             }
         }
     }
 }
 
-/// Attempt to parse a single JSON value.  Special cases:
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /* Misc parsing */
+    ExpectedXsFoundY(Item, usize, &'static [Expected], char),
+    ExpectedXsFoundEof(Item, &'static [Expected]),
+    InvalidTrailingWhitespace(usize, char),
+    /* String parsing */
+    EofDuringString(usize), // Index refers to the start of the unterminated string
+    InvalidEscape(usize, char),
+    InvalidHexEscape(usize, usize, char), // First index refers to the `\`
+    ControlCharInString(usize, char),
+    /* Number parsing */
+    LeadingZero(usize),
+    SecondDecimalPoint(usize),
+    InvalidCharInExponent(usize, char),
+    EmptyExponent(usize), // `usize` is the index of the 'E'/'e'
+}
+
+/// An item that could be being parsed when an error was generated
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Item {
+    TopLevelValue,         // Top level JSON value
+    Literal(&'static str), // JSON literal (`true`, `false` or `null`)
+    Number,                // JSON number
+    Array(usize),          // JSON array (index refers to the opening `[`)
+    Object(usize),         // JSON object (index refers to the opening `{`)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expected {
+    Key,        // Expected a JSON string as an object key
+    Value,      // Expected any JSON value
+    Char(char), // Expected a given char
+    Digit,      // Expected '[0-9]'
+}
+
+impl Error {
+    /// Given the value from the [`Iter`]ator and an expected value, generate either an
+    /// [`Error::ExpectedXFoundY`] or an [`Error::ExpectedXFoundEof`].
+    fn expected_xs_found(
+        item: Item,
+        expected: &'static [Expected],
+        v: Option<(usize, char)>,
+    ) -> Self {
+        match v {
+            Some((idx, c)) => Error::ExpectedXsFoundY(item, idx, expected, c),
+            None => Error::ExpectedXsFoundEof(item, expected),
+        }
+    }
+}
+
+/// Attempt to parse a JSON value.
+///
+/// NOTE: This does not parse trailing whitespace
+fn parse_value<'source>(item: Item, iter: &mut Iter<'source>) -> Result<Node<'source>> {
+    let (idx, unexpected_char) =
+        match parse_value_or_closing_bracket(item, &[Expected::Value], iter)? {
+            ValueParseResult::Node(n) => return Ok(n),
+            ValueParseResult::CloseBrace(idx) => (idx, '}'),
+            ValueParseResult::CloseSquare(idx) => (idx, ']'),
+        };
+    Err(Error::ExpectedXsFoundY(
+        item,
+        idx,
+        &[Expected::Value],
+        unexpected_char,
+    ))
+}
+
+/// Attempt to parse a single JSON value, or a closing bracket (']' or '}').  Special cases:
 /// - If the first non-whitespace char is `]`, then `Some(CloseSquare)` is returned
 /// - If the first non-whitespace char is `}`, then `Some(CloseBrace)` is returned
 ///
 /// NOTE: This does not parse trailing whitespace
-fn parse_value<'source>(iter: &mut Iter<'source>) -> Option<ValueParseResult<'source>> {
+fn parse_value_or_closing_bracket<'source>(
+    item: Item,
+    expected: &'static [Expected],
+    iter: &mut Iter<'source>,
+) -> Result<ValueParseResult<'source>> {
     while let Some((start_idx, c)) = iter.next() {
         /// Consume a sequence of chars, erroring if it's not as expected
         macro_rules! expect_ident {
-            ($len: literal => $( $chars: pat ),*) => {{
+            ($ident_name: literal => $( $chars: literal ),*) => {{
                 // Consume each char in turn, erroring if any of them aren't expected
-                $( expect_char_pattern!(iter, $chars); )*
+                $(
+                match iter.next() {
+                    Some((_, $chars)) => (),
+                    v => return Err(Error::expected_xs_found(
+                        Item::Literal($ident_name),
+                        &[Expected::Char($chars)],
+                        v
+                    )),
+                }
+                )*
                 // Construct and return an atom node
-                let sub_str = &iter.source[start_idx..start_idx + $len];
+                let len = $ident_name.len();
+                let sub_str = &iter.source[start_idx..start_idx + len];
                 Node {
-                    unsplit_width: $len,
+                    unsplit_width: len,
                     kind: NodeKind::Atom(sub_str),
                 }
             }};
@@ -70,127 +126,184 @@ fn parse_value<'source>(iter: &mut Iter<'source>) -> Option<ValueParseResult<'so
 
         let value_node = match c {
             ' ' | '\t' | '\n' | '\r' => continue, // Ignore whitespace
-            '[' => parse_array(iter)?,
-            '{' => parse_object(iter)?,
+            '[' => parse_array(start_idx, iter)?,
+            '{' => parse_object(start_idx, iter)?,
             '"' => Node::new_atom(parse_string(start_idx, iter)?),
             // If a '-' is reached, it must be followed by a digit then a number without
             // the leading digit
             '-' => match iter.next() {
                 Some((_, '0')) => parse_number_after_leading_0(start_idx, iter)?,
                 Some((_, '1'..='9')) => parse_number_after_first_non_zero(start_idx, iter)?,
-                _ => return None, // '-' must be followed by [0-9]
+                v => {
+                    return Err(Error::expected_xs_found(
+                        Item::Number,
+                        &[Expected::Digit],
+                        v,
+                    ));
+                }
             },
             '0' => parse_number_after_leading_0(start_idx, iter)?,
             '1'..='9' => parse_number_after_first_non_zero(start_idx, iter)?,
-            'n' => expect_ident!(4 => 'u', 'l', 'l'),
-            't' => expect_ident!(4 => 'r', 'u', 'e'),
-            'f' => expect_ident!(5 => 'a', 'l', 's', 'e'),
-            ']' => return Some(ValueParseResult::CloseSquare),
-            '}' => return Some(ValueParseResult::CloseBrace),
-            _ => return None, // No other chars are a valid start to a JSON value
+            'n' => expect_ident!("null" => 'u', 'l', 'l'),
+            't' => expect_ident!("true" => 'r', 'u', 'e'),
+            'f' => expect_ident!("false" => 'a', 'l', 's', 'e'),
+            ']' => return Ok(ValueParseResult::CloseSquare(start_idx)),
+            '}' => return Ok(ValueParseResult::CloseBrace(start_idx)),
+            _ => return Err(Error::ExpectedXsFoundY(item, start_idx, expected, c)),
         };
         // If a JSON value was successfully parsed, return that value
-        return Some(ValueParseResult::Node(value_node));
+        return Ok(ValueParseResult::Node(value_node));
     }
-    None // If a JSON object was missing when the file ended, then that's an error
+    // If a JSON object was missing when the file ended, then that's an error
+    Err(Error::ExpectedXsFoundEof(item, &[Expected::Value]))
+}
+
+/// The result generated when a JSON value is parsed.  Special cases are made for ']' and '}' to
+/// prevent lookahead for empty arrays/objects.
+enum ValueParseResult<'source> {
+    /// The value parsed to a node
+    Node(Node<'source>),
+    /// The first non-whitespace char was `']'`
+    CloseSquare(usize),
+    /// The first non-whitespace char was `'}'`
+    CloseBrace(usize),
 }
 
 /// Attempt to parse the chars in `iter` as an array, **assuming that the initial `[` has
 /// been consumed**.
-fn parse_array<'source>(iter: &mut Iter<'source>) -> Option<Node<'source>> {
+fn parse_array<'source>(start_idx: usize, iter: &mut Iter<'source>) -> Result<Node<'source>> {
     // Parse the first element
-    match parse_value(iter)? {
-        ValueParseResult::Node(n) => {
-            // Found one value, so parse the others
-            let mut unsplit_width = "[".len() + n.unsplit_width + "]".len();
-            let mut contents = vec![n];
-            // Repeatedly expect either:
-            // - ',' followed by another element, or
-            // - ']', finishing the array
-            while let Some((_, c)) = iter.next() {
-                match c {
-                    ' ' | '\t' | '\n' | '\r' => continue, // Ignore whitespace
-                    ']' => {
-                        // Finish the array
-                        return Some(Node {
-                            unsplit_width,
-                            kind: NodeKind::Array(contents),
-                        });
-                    }
-                    ',' => {
-                        // Parse another element, before looking for ',' or ']' again
-                        if let Some(ValueParseResult::Node(n)) = parse_value(iter) {
-                            unsplit_width += ", ".len() + n.unsplit_width;
-                            contents.push(n);
-                        } else {
-                            return None; // If we didn't parse a value, then error
-                        }
-                    }
-                    _ => return None, // No other chars are allowed
-                }
-            }
-            return None; // It's an error for the file to end part-way through an array
-        }
+    let first_value = match parse_value_or_closing_bracket(
+        Item::Array(start_idx),
+        &[Expected::Value, Expected::Char(']')],
+        iter,
+    )? {
         // Array is `[]`, and therefore empty
-        ValueParseResult::CloseSquare => Some(Node {
-            unsplit_width: "[]".len(),
-            kind: NodeKind::Array(vec![]),
-        }),
-        ValueParseResult::CloseBrace => None, // Can't end an array with `}`
+        ValueParseResult::CloseSquare(_) => {
+            return Ok(Node {
+                unsplit_width: "[]".len(),
+                kind: NodeKind::Array(vec![]),
+            })
+        }
+        // Can't end an array with `}`
+        ValueParseResult::CloseBrace(idx) => {
+            return Err(Error::ExpectedXsFoundY(
+                Item::Array(start_idx),
+                idx,
+                &[Expected::Value, Expected::Char(']')],
+                '}',
+            ))
+        }
+        // We parsed a value, so parse the rest of the array
+        ValueParseResult::Node(n) => n,
+    };
+
+    let mut unsplit_width = "[".len() + first_value.unsplit_width + "]".len();
+    let mut contents = vec![first_value];
+    // Repeatedly expect either:
+    // - ',' followed by another element, or
+    // - ']', finishing the array
+    loop {
+        match iter.next() {
+            Some((_, ' ' | '\t' | '\n' | '\r')) => continue, // Ignore whitespace
+            // If ']', finish the array
+            Some((_, ']')) => {
+                return Ok(Node {
+                    unsplit_width,
+                    kind: NodeKind::Array(contents),
+                });
+            }
+            // If ',', parse another element and repeat
+            Some((_, ',')) => {
+                let n = parse_value(Item::Array(start_idx), iter)?;
+                unsplit_width += ", ".len() + n.unsplit_width;
+                contents.push(n);
+            }
+            // Anything except whitespace, ',' or ']' is an error
+            v => {
+                return Err(Error::expected_xs_found(
+                    Item::Array(start_idx),
+                    &[Expected::Char(','), Expected::Char(']')],
+                    v,
+                ));
+            }
+        }
     }
 }
 
 /// Attempt to parse an object, **assuming that the initial `{` has been consumed**.
-fn parse_object<'source>(iter: &mut Iter<'source>) -> Option<Node<'source>> {
+fn parse_object<'source>(start_idx: usize, iter: &mut Iter<'source>) -> Result<Node<'source>> {
     let mut fields = Vec::<(&str, Node)>::new();
     let mut unsplit_width = "{ ".len() + " }".len();
     loop {
         // Parse ws until we get to a '"' for the key (returning if we see '}' and this is
         // the first field)
         let key = loop {
-            let (start_idx, c) = iter.next()?;
-            match c {
-                ' ' | '\t' | '\n' | '\r' => continue, // Ignore whitespace
-                '"' => break parse_string(start_idx, iter)?,
-                '}' if fields.is_empty() => {
+            match iter.next() {
+                Some((_, ' ' | '\t' | '\n' | '\r')) => continue, // Ignore whitespace
+                Some((start_idx, '"')) => break parse_string(start_idx, iter)?, // Parse key
+                Some((_, '}')) if fields.is_empty() => {
                     // '}' before the first key is an empty object
-                    // TODO: Report idempotence bug
-                    return Some(Node {
+                    // TODO: Report idempotence bug in rustfmt
+                    return Ok(Node {
                         unsplit_width: 2, // "{}"
                         kind: NodeKind::Object(vec![]),
                     });
                 }
-                _ => return None, // Any other char is an error
+                // Any other char is an error
+                v => {
+                    let expected: &[Expected] = match fields.len() {
+                        0 => &[Expected::Key, Expected::Char('}')],
+                        _ => &[Expected::Key],
+                    };
+                    return Err(Error::expected_xs_found(
+                        Item::Object(start_idx),
+                        expected,
+                        v,
+                    ));
+                }
             }
         };
         // Read whitespace until we find a ':'
         loop {
-            match iter.next()?.1 {
-                ' ' | '\t' | '\n' | '\r' => continue,
-                ':' => break,     // ':' means we parse the key
-                _ => return None, // Anything other than ':' or whitespace is an error
+            match iter.next() {
+                Some((_, ' ' | '\t' | '\n' | '\r')) => continue,
+                Some((_, ':')) => break, // Found ':', parse the value
+                // Anything other than ':' or whitespace is an error
+                v => {
+                    return Err(Error::expected_xs_found(
+                        Item::Object(start_idx),
+                        &[Expected::Char(':')],
+                        v,
+                    ));
+                }
             }
         }
         // Parse the contained value
-        let value = match parse_value(iter) {
-            Some(ValueParseResult::Node(n)) => n,
-            _ => return None,
-        };
+        let value = parse_value(Item::Object(start_idx), iter)?;
         // Add the field we just parsed
         unsplit_width += key.len() + ": ".len() + value.unsplit_width;
         fields.push((key, value));
         // Consume either ',' (parse next key/value pair) or '}' (end object)
         loop {
-            match iter.next()?.1 {
-                ' ' | '\t' | '\n' | '\r' => continue,
-                ',' => break, // if ',', parse the next key/value pair
-                '}' => {
-                    return Some(Node {
+            match iter.next() {
+                Some((_, ' ' | '\t' | '\n' | '\r')) => continue,
+                Some((_, ',')) => break, // if ',', parse the next key/value pair
+                Some((_, '}')) => {
+                    // if '}', the object is finished
+                    return Ok(Node {
                         unsplit_width,
                         kind: NodeKind::Object(fields),
                     });
                 }
-                _ => return None, // Any other char is an error
+                v => {
+                    // Anything except whitespace, ',' or '}' is an error
+                    return Err(Error::expected_xs_found(
+                        Item::Object(start_idx),
+                        &[Expected::Char(','), Expected::Char('}')],
+                        v,
+                    ));
+                }
             }
         }
         unsplit_width += ", ".len(); // Add space required by the comma
@@ -201,27 +314,39 @@ fn parse_object<'source>(iter: &mut Iter<'source>) -> Option<Node<'source>> {
 /// been consumed**.  This returns a string slice **from the JSON source code**, i.e. the fully
 /// escaped string complete with the enclosing `"`s.  We do not attempt to decode the string, we
 /// simply verify that it conforms to the JSON standard.
-fn parse_string<'source>(start_idx: usize, iter: &mut Iter<'source>) -> Option<&'source str> {
+fn parse_string<'source>(start_idx: usize, iter: &mut Iter<'source>) -> Result<&'source str> {
     while let Some((idx, c)) = iter.next() {
         match c {
             // If we find an unescaped quote, then terminate the string.
             // `+ 1` is OK because '"' has UTF-8 length of 1 byte
-            '"' => return Some(&iter.source[start_idx..idx + 1]),
-            '\\' => match iter.next()?.1 {
-                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {} // Valid escape chars
-                'u' => {
+            '"' => return Ok(&iter.source[start_idx..idx + 1]),
+            '\\' => match iter.next() {
+                Some((_, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't')) => {} // Valid escape chars
+                Some((_, 'u')) => {
                     // `\u` should be followed by 4 hex chars
                     for _ in 0..4 {
-                        expect_char_pattern!(iter, ('0'..='9' | 'a'..='f' | 'A'..='F'));
+                        match iter.next() {
+                            Some((_, '0'..='9' | 'a'..='f' | 'A'..='F')) => {} // Valid hex char
+                            Some((bad_idx, bad_char)) => {
+                                return Err(Error::InvalidHexEscape(idx, bad_idx, bad_char));
+                            }
+                            None => return Err(Error::EofDuringString(start_idx)),
+                        }
                     }
                 }
-                _ => return None, // Invalid escape sequence
+                // Invalid escape sequence
+                Some((bad_escape_idx, bad_escape_char)) => {
+                    return Err(Error::InvalidEscape(bad_escape_idx, bad_escape_char));
+                }
+                None => return Err(Error::EofDuringString(start_idx)),
             },
-            '\0'..='\x19' => return None, // Control chars aren't allowed in strings
-            _ => {}                       // Any other char is just part of the string
+            // Control chars aren't allowed in strings
+            '\0'..='\x19' => return Err(Error::ControlCharInString(idx, c)),
+            _ => {} // Any other char is just part of the string
         }
     }
-    None // If a file ended during a string, then that's an error
+    // If a file ended during a string, then that's an error
+    Err(Error::EofDuringString(start_idx))
 }
 
 ////////////////////
@@ -233,9 +358,11 @@ fn parse_string<'source>(start_idx: usize, iter: &mut Iter<'source>) -> Option<&
 fn parse_number_after_leading_0<'source>(
     start_idx: usize,
     iter: &mut Iter<'source>,
-) -> Option<Node<'source>> {
-    Some(match iter.peek_char() {
-        Some('1'..='9') => return None, // Leading 0
+) -> Result<Node<'source>> {
+    Ok(match iter.peek_char() {
+        // `iter.peek_idx() - 1` is the index of the last ASCII value consumed (in this case, the
+        // leading '0')
+        Some('1'..='9') => return Err(Error::LeadingZero(iter.peek_idx() - 1)),
         Some('.') => {
             iter.next();
             parse_number_after_decimal_point(start_idx, iter)?
@@ -255,7 +382,7 @@ fn parse_number_after_leading_0<'source>(
 fn parse_number_after_first_non_zero<'source>(
     start_idx: usize,
     iter: &mut Iter<'source>,
-) -> Option<Node<'source>> {
+) -> Result<Node<'source>> {
     // TODO: Refactor all these functions into one loop?
     loop {
         match iter.peek_char() {
@@ -272,7 +399,7 @@ fn parse_number_after_first_non_zero<'source>(
             }
             // Anything that isn't part of a number belongs to the next token (e.g. ',' to
             // move onto the next array element)
-            _ => return Some(iter.new_atom_starting_from(start_idx)),
+            _ => return Ok(iter.new_atom_starting_from(start_idx)),
         }
     }
 }
@@ -282,20 +409,21 @@ fn parse_number_after_first_non_zero<'source>(
 fn parse_number_after_decimal_point<'source>(
     start_idx: usize,
     iter: &mut Iter<'source>,
-) -> Option<Node<'source>> {
+) -> Result<Node<'source>> {
     loop {
         match iter.peek_char() {
             Some('0'..='9') => {
                 iter.next(); // Keep consuming numbers
             }
-            Some('.') => return None, // Can't have multiple decimal points
+            // Can't have multiple decimal points
+            Some('.') => return Err(Error::SecondDecimalPoint(iter.peek_idx())),
             Some('e' | 'E') => {
                 iter.next(); // Consume the 'e'/'E'
                 return parse_number_after_exponent(start_idx, iter);
             }
             // Anything that isn't part of a number belongs to the next token (e.g. ',' to
             // move onto the next array element)
-            _ => return Some(iter.new_atom_starting_from(start_idx)),
+            _ => return Ok(iter.new_atom_starting_from(start_idx)),
         }
     }
 }
@@ -305,7 +433,9 @@ fn parse_number_after_decimal_point<'source>(
 fn parse_number_after_exponent<'source>(
     start_idx: usize,
     iter: &mut Iter<'source>,
-) -> Option<Node<'source>> {
+) -> Result<Node<'source>> {
+    // 'E' or 'e' is the last char popped, and it has UTF-8 length of 1 byte
+    let exponent_idx = iter.peek_idx() - 1;
     // An exponent can optionally start with a '+' or '-'
     if let Some('+' | '-') = iter.peek_char() {
         iter.next(); // Consume the '+/-' if it exists, otherwise start parsing digits
@@ -315,14 +445,15 @@ fn parse_number_after_exponent<'source>(
     loop {
         match iter.peek_char() {
             Some('0'..='9') => iter.next(), // Numbers are always valid exponents
-            Some('.') => return None,       // Can't have decimal exponents
-            Some('e' | 'E') => return None, // Can't have multiple exponents
-            Some('+' | '-') => return None, // Can't have '+' or '-' in the middle of an exponent
+            Some(c @ ('.' | 'e' | 'E' | '+' | '-')) => {
+                return Err(Error::InvalidCharInExponent(iter.peek_idx(), c));
+            }
             // Anything that isn't part of a number belongs to the next token (e.g. ',' to
             // move onto the next array element)
             _ => match has_at_least_one_digit {
-                true => return Some(iter.new_atom_starting_from(start_idx)),
-                false => return None,
+                true => return Ok(iter.new_atom_starting_from(start_idx)),
+                // `- 1` steps backwards over the `E` or `e` (both of which occupy 1 byte in UTF-8)
+                false => return Err(Error::EmptyExponent(exponent_idx)),
             },
         };
         has_at_least_one_digit = true;
@@ -379,8 +510,8 @@ mod test {
     use super::*;
 
     #[track_caller]
-    fn check_fail(s: &str) {
-        assert_eq!(Node::parse(s), None,);
+    fn check_fail(s: &str, err: Error) {
+        assert_eq!(Node::parse(s), Err(err));
     }
 
     #[track_caller]
@@ -401,15 +532,27 @@ mod test {
 
     #[track_caller]
     fn check_ok(s: &str, exp_node: Node) {
-        assert_eq!(Node::parse(s), Some(exp_node));
+        assert_eq!(Node::parse(s), Ok(exp_node));
     }
 
     #[test]
-    fn fails() {
-        check_fail("]");
-        check_fail("}");
-        check_fail("}   ");
-        check_fail("  \t\n}   ");
+    fn unmatched_closing_bracket() {
+        check_fail(
+            "]",
+            Error::ExpectedXsFoundY(Item::TopLevelValue, 0, &[Expected::Value], ']'),
+        );
+        check_fail(
+            "}",
+            Error::ExpectedXsFoundY(Item::TopLevelValue, 0, &[Expected::Value], '}'),
+        );
+        check_fail(
+            "}   ",
+            Error::ExpectedXsFoundY(Item::TopLevelValue, 0, &[Expected::Value], '}'),
+        );
+        check_fail(
+            "  \t\n}   ",
+            Error::ExpectedXsFoundY(Item::TopLevelValue, 4, &[Expected::Value], '}'),
+        );
     }
 
     #[test]
@@ -419,7 +562,8 @@ mod test {
         check_atom_no_ws("null");
         check_atom("    null", "null");
         check_atom("    null\t\n  ", "null");
-        check_fail("    null  x"); // Check for things in trailing ws
+        // Check for things in trailing whitespace
+        check_fail("    null  x", Error::InvalidTrailingWhitespace(10, 'x'));
     }
 
     #[test]
@@ -434,18 +578,25 @@ mod test {
         check_atom_no_ws(r#""thing \uAFFF thing""#);
         check_atom_no_ws(r#""thing \u01aF thing""#);
         // Invalid escape
-        check_fail(r#""thing \x thing""#);
-        check_fail(r#""thing \uAFXF thing""#);
+        check_fail(r#""thing \x thing""#, Error::InvalidEscape(8, 'x'));
+        check_fail(
+            r#""thing \uAFXF thing""#,
+            Error::InvalidHexEscape(7, 11, 'X'),
+        );
         // Leading/trailing whitespace
         check_atom("\r   \"\"", r#""""#);
         check_atom("\"\"  \r\t  \n  ", r#""""#);
         check_atom("\r   \"\"  \r\t  \n  ", r#""""#);
         check_atom("\r   \"string\"  \r\t  \n  ", r#""string""#);
         // Control chars in a string aren't allowed
-        check_fail("    \"\0\"  x");
-        check_fail("    \"\n\"  x");
-        check_fail("    \"\t\"  x");
-        check_fail(r#"    "string"  x"#); // Check for things in trailing ws
+        check_fail("    \"\0\"  x", Error::ControlCharInString(5, '\0'));
+        check_fail("    \"\n\"  x", Error::ControlCharInString(5, '\n'));
+        check_fail("    \"\t\"  x", Error::ControlCharInString(5, '\t'));
+        // Check for things in trailing whitespace
+        check_fail(
+            r#"    "string"  x"#,
+            Error::InvalidTrailingWhitespace(14, 'x'),
+        );
     }
 
     #[test]
@@ -453,19 +604,19 @@ mod test {
         check_atom_no_ws("0");
         check_atom_no_ws("-0");
         check_atom("   0   \t\n ", "0");
-        check_fail("02");
-        check_fail("-02");
+        check_fail("02", Error::LeadingZero(0));
+        check_fail("-02", Error::LeadingZero(1));
         check_atom_no_ws("10233415216992347901");
         check_atom_no_ws("0.2");
-        check_fail("0.2.3");
+        check_fail("0.2.3", Error::SecondDecimalPoint(3));
         check_atom_no_ws("-0.00002");
         check_atom_no_ws("0.0200000");
         check_atom_no_ws("0.02e1");
         check_atom_no_ws("0.02E-1201");
         check_atom_no_ws("0.02e-1201");
         check_atom_no_ws("0.02e+01201");
-        check_fail("0.02e");
-        check_fail("0.02e-");
+        check_fail("0.02e", Error::EmptyExponent(4));
+        check_fail("0.02e-", Error::EmptyExponent(4));
         check_atom_no_ws("0e-01"); // Leading 0s in exponents is apparently allowed?
         check_atom_no_ws("0e01"); // Leading 0s in exponents is apparently allowed?
     }
@@ -486,7 +637,15 @@ mod test {
                 kind: NodeKind::Array(vec![]),
             },
         );
-        check_fail("    [  }\r\t  \n");
+        check_fail(
+            "    [  }\r\t  \n",
+            Error::ExpectedXsFoundY(
+                Item::Array(4),
+                7,
+                &[Expected::Value, Expected::Char(']')],
+                '}',
+            ),
+        );
         check_ok(
             "    [ true ]\r\t  \n",
             Node {
@@ -494,7 +653,10 @@ mod test {
                 kind: NodeKind::Array(vec![Node::new_atom("true")]),
             },
         );
-        check_fail("    [ true, ]\r\t  \n");
+        check_fail(
+            "    [ true, ]\r\t  \n",
+            Error::ExpectedXsFoundY(Item::Array(4), 12, &[Expected::Value], ']'),
+        );
         check_ok(
             "    [ true, false ]\r\t  \n",
             Node {
@@ -632,46 +794,168 @@ mod test {
         //   after RFC7159 (https://www.ietf.org/rfc/rfc7159.txt)
         // - fail18.json was removed because JSON doesn't have a depth limit
 
-        check_fail(r#"["Unclosed array""#); // fail2.json
-        check_fail(r#"{unquoted_key: "keys must be quoted"}"#); // fail3.json
-        check_fail(r#"["extra comma",]"#); // fail4.json
-        check_fail(r#"["double extra comma",,]"#); // fail5.json
-        check_fail(r#"[   , "<-- missing value"]"#); // fail6.json
-        check_fail(r#"["Comma after the close"],"#); // fail7.json
-        check_fail(r#"["Extra close"]]"#); // fail8.json
-        check_fail(r#"{"Extra comma": true,}"#); // fail9.json
+        check_fail(
+            r#"["Unclosed array""#,
+            Error::ExpectedXsFoundEof(Item::Array(0), &[Expected::Char(','), Expected::Char(']')]),
+        ); // fail2.json
+        check_fail(
+            r#"{unquoted_key: "keys must be quoted"}"#,
+            Error::ExpectedXsFoundY(
+                Item::Object(0),
+                1,
+                &[Expected::Key, Expected::Char('}')],
+                'u',
+            ),
+        ); // fail3.json
+        check_fail(
+            r#"["extra comma",]"#,
+            Error::ExpectedXsFoundY(Item::Array(0), 15, &[Expected::Value], ']'),
+        ); // fail4.json
+        check_fail(
+            r#"["double extra comma",,]"#,
+            Error::ExpectedXsFoundY(Item::Array(0), 22, &[Expected::Value], ','),
+        ); // fail5.json
+        check_fail(
+            r#"[   , "<-- missing value"]"#,
+            Error::ExpectedXsFoundY(
+                Item::Array(0),
+                4,
+                &[Expected::Value, Expected::Char(']')],
+                ',',
+            ),
+        ); // fail6.json
+        check_fail(
+            r#"["Comma after the close"],"#,
+            Error::InvalidTrailingWhitespace(25, ','),
+        ); // fail7.json
+        check_fail(
+            r#"["Extra close"]]"#,
+            Error::InvalidTrailingWhitespace(15, ']'),
+        ); // fail8.json
+        check_fail(
+            r#"{"Extra comma": true,}"#,
+            Error::ExpectedXsFoundY(Item::Object(0), 21, &[Expected::Key], '}'),
+        ); // fail9.json
 
-        check_fail(r#"{"Extra value after close": true} "misplaced quoted value""#); // fail10.json
-        check_fail(r#"{"Illegal expression": 1 + 2}"#); // fail11.json
-        check_fail(r#"{"Illegal invocation": alert()}"#); // fail12.json
-        check_fail(r#"{"Numbers cannot have leading zeroes": 013}"#); // fail13.json
-        check_fail(r#"{"Numbers cannot be hex": 0x14}"#); // fail14.json
-        check_fail(r#"["Illegal backslash escape: \x15"]"#); // fail15.json
-        check_fail(r#"[\naked]"#); // fail16.json
-        check_fail(r#"["Illegal backslash escape: \017"]"#); // fail17.json
-        check_fail(r#"{"Missing colon" null}"#); // fail19.json
+        check_fail(
+            r#"{"Extra value after close": true} "misplaced quoted value""#,
+            Error::InvalidTrailingWhitespace(34, '"'),
+        ); // fail10.json
+        check_fail(
+            r#"{"Illegal expression": 1 + 2}"#,
+            Error::ExpectedXsFoundY(
+                Item::Object(0),
+                25,
+                &[Expected::Char(','), Expected::Char('}')],
+                '+',
+            ),
+        ); // fail11.json
+        check_fail(
+            r#"{"Illegal invocation": alert()}"#,
+            Error::ExpectedXsFoundY(Item::Object(0), 23, &[Expected::Value], 'a'),
+        ); // fail12.json
+        check_fail(
+            r#"{"Numbers cannot have leading zeroes": 013}"#,
+            Error::LeadingZero(39),
+        ); // fail13.json
+        check_fail(
+            // TODO: Handle this better.  We should probably handle this differently because it's
+            // just after a number
+            r#"{"Numbers cannot be hex": 0x14}"#,
+            Error::ExpectedXsFoundY(
+                Item::Object(0),
+                27,
+                &[Expected::Char(','), Expected::Char('}')],
+                'x',
+            ),
+        ); // fail14.json
+        check_fail(
+            r#"["Illegal backslash escape: \x15"]"#,
+            Error::InvalidEscape(29, 'x'),
+        ); // fail15.json
+        check_fail(
+            r#"[\naked]"#,
+            Error::ExpectedXsFoundY(
+                Item::Array(0),
+                1,
+                &[Expected::Value, Expected::Char(']')],
+                '\\',
+            ),
+        ); // fail16.json
+        check_fail(
+            r#"["Illegal backslash escape: \017"]"#,
+            Error::InvalidEscape(29, '0'),
+        ); // fail17.json
+        check_fail(
+            r#"{"Missing colon" null}"#,
+            Error::ExpectedXsFoundY(Item::Object(0), 17, &[Expected::Char(':')], 'n'),
+        ); // fail19.json
 
-        check_fail(r#"{"Double colon":: null}"#); // fail20.json
-        check_fail(r#"{"Comma instead of colon", null}"#); // fail21.json
-        check_fail(r#"["Colon instead of comma": false]"#); // fail22.json
-        check_fail(r#"["Bad value", truth]"#); // fail23.json
-        check_fail(r#"['single quote']"#); // fail24.json
-        check_fail(r#"["	tab	character	in	string	"]"#); // fail25.json
-        check_fail(r#"["tab\   character\   in\  string\  "]"#); // fail26.json
+        check_fail(
+            r#"{"Double colon":: null}"#,
+            Error::ExpectedXsFoundY(Item::Object(0), 16, &[Expected::Value], ':'),
+        ); // fail20.json
+        check_fail(
+            r#"{"Comma instead of colon", null}"#,
+            Error::ExpectedXsFoundY(Item::Object(0), 25, &[Expected::Char(':')], ','),
+        ); // fail21.json
+        check_fail(
+            r#"["Colon instead of comma": false]"#,
+            Error::ExpectedXsFoundY(
+                Item::Array(0),
+                25,
+                &[Expected::Char(','), Expected::Char(']')],
+                ':',
+            ),
+        ); // fail22.json
+        check_fail(
+            r#"["Bad value", truth]"#,
+            Error::ExpectedXsFoundY(Item::Literal("true"), 17, &[Expected::Char('e')], 't'),
+        ); // fail23.json
+        check_fail(
+            r#"['single quote']"#,
+            Error::ExpectedXsFoundY(
+                Item::Array(0),
+                1,
+                &[Expected::Value, Expected::Char(']')],
+                '\'',
+            ),
+        ); // fail24.json
+        check_fail(
+            r#"["	tab	character	in	string	"]"#,
+            Error::ControlCharInString(2, '\t'),
+        ); // fail25.json
+        check_fail(
+            r#"["tab\   character\   in\  string\  "]"#,
+            Error::InvalidEscape(6, ' '),
+        ); // fail26.json
         check_fail(
             r#"["line
 break"]"#,
+            Error::ControlCharInString(6, '\n'),
         ); // fail27.json
         check_fail(
             r#"["line\
 break"]"#,
+            Error::InvalidEscape(7, '\n'),
         ); // fail28.json
-        check_fail(r#"[0e]"#); // fail29.json
+        check_fail(r#"[0e]"#, Error::EmptyExponent(2)); // fail29.json
 
-        check_fail(r#"[0e+]"#); // fail30.json
-        check_fail(r#"[0e+-1]"#); // fail31.json
-        check_fail(r#"{"Comma instead if closing brace": true,"#); // fail32.json
-        check_fail(r#"["mismatch"}"#); // fail33.json
+        check_fail(r#"[0e+]"#, Error::EmptyExponent(2)); // fail30.json
+        check_fail(r#"[0e+-1]"#, Error::InvalidCharInExponent(4, '-')); // fail31.json
+        check_fail(
+            r#"{"Comma instead if closing brace": true,"#,
+            Error::ExpectedXsFoundEof(Item::Object(0), &[Expected::Key]),
+        ); // fail32.json
+        check_fail(
+            r#"["mismatch"}"#,
+            Error::ExpectedXsFoundY(
+                Item::Array(0),
+                11,
+                &[Expected::Char(','), Expected::Char(']')],
+                '}',
+            ),
+        ); // fail33.json
     }
 
     #[test]
@@ -762,6 +1046,6 @@ break"]"#,
 1e00,2e+00,2e-00
 ,"rosebud"]"#,
         )
-        .is_some()); // pass1.json
+        .is_ok()); // pass1.json
     }
 }

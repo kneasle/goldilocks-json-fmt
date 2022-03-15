@@ -5,13 +5,15 @@
 mod formatting;
 mod parsing;
 
-pub fn format(s: &str) -> Option<String> {
+pub fn format(s: &str) -> Result<String> {
     format_with_config(s, &Config::default())
 }
 
-pub fn format_with_config(s: &str, config: &Config) -> Option<String> {
+pub fn format_with_config(s: &str, config: &Config) -> Result<String> {
     Node::parse(s).map(|ast| ast.format(config))
 }
+
+pub type Result<T> = std::result::Result<T, parsing::Error>;
 
 #[derive(Debug, Clone)]
 pub struct Config {
