@@ -1,6 +1,6 @@
 //! Code to parse JSON string into an AST
 
-use crate::{Node, NodeKind, Result};
+use crate::{Error, Expected, Item, Node, NodeKind, Result};
 
 impl<'source> Node<'source> {
     /// Parse a [`str`]ing into a JSON node
@@ -16,57 +16,6 @@ impl<'source> Node<'source> {
                 Some((idx, c)) => return Err(Error::InvalidTrailingWhitespace(idx, c)),
                 None => return Ok(ast_root), // EOF with only whitespace is fine
             }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Error {
-    /* Misc parsing */
-    ExpectedXsFoundY(Item, usize, &'static [Expected], char),
-    ExpectedXsFoundEof(Item, &'static [Expected]),
-    InvalidTrailingWhitespace(usize, char),
-    /* String parsing */
-    EofDuringString(usize), // Index refers to the start of the unterminated string
-    InvalidEscape(usize, char),
-    InvalidHexEscape(usize, usize, char), // First index refers to the `\`
-    ControlCharInString(usize, char),
-    /* Number parsing */
-    LeadingZero(usize),
-    SecondDecimalPoint(usize),
-    InvalidCharInExponent(usize, char),
-    EmptyExponent(usize), // `usize` is the index of the 'E'/'e'
-}
-
-/// An item that could be being parsed when an error was generated
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Item {
-    TopLevelValue,         // Top level JSON value
-    Literal(&'static str), // JSON literal (`true`, `false` or `null`)
-    Number,                // JSON number
-    Array(usize),          // JSON array (index refers to the opening `[`)
-    Object(usize),         // JSON object (index refers to the opening `{`)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Expected {
-    Key,        // Expected a JSON string as an object key
-    Value,      // Expected any JSON value
-    Char(char), // Expected a given char
-    Digit,      // Expected '[0-9]'
-}
-
-impl Error {
-    /// Given the value from the [`Iter`]ator and an expected value, generate either an
-    /// [`Error::ExpectedXFoundY`] or an [`Error::ExpectedXFoundEof`].
-    fn expected_xs_found(
-        item: Item,
-        expected: &'static [Expected],
-        v: Option<(usize, char)>,
-    ) -> Self {
-        match v {
-            Some((idx, c)) => Error::ExpectedXsFoundY(item, idx, expected, c),
-            None => Error::ExpectedXsFoundEof(item, expected),
         }
     }
 }
