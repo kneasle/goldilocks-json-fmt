@@ -1,5 +1,9 @@
 //! Code to convert an AST into a pretty-formatted string
 
+// `str::push` is non-const, so pushing single-char strings gets compiled down to plain data writes
+// and is therefore faster.
+#![allow(clippy::single_char_add_str)]
+
 use crate::{Config, Node, NodeKind};
 
 impl Node<'_> {
@@ -74,13 +78,13 @@ impl Node<'_> {
                     }
                     // Add the first value
                     out.push_str("\n");
-                    out.push_str(&indentation_str);
+                    out.push_str(indentation_str);
                     first_val.write_to_string(indentation_str.len(), indentation_str, out, config);
                     // Other values
                     for val in val_iter {
                         // Comma for the previous value
                         out.push_str(",\n");
-                        out.push_str(&indentation_str);
+                        out.push_str(indentation_str);
                         // Next value
                         val.write_to_string(indentation_str.len(), indentation_str, out, config)
                     }
@@ -91,7 +95,7 @@ impl Node<'_> {
                 }
                 // Final `]` on a its own line
                 out.push_str("\n");
-                out.push_str(&indentation_str);
+                out.push_str(indentation_str);
                 out.push_str("]");
             }
             NodeKind::Object(fields) => {
@@ -111,7 +115,7 @@ impl Node<'_> {
                     is_first_field = false;
                     // New line for the next key
                     out.push_str("\n");
-                    out.push_str(&indentation_str);
+                    out.push_str(indentation_str);
                     // `key: value`
                     out.push_str(key);
                     out.push_str(": ");
@@ -128,7 +132,7 @@ impl Node<'_> {
                 }
                 // Final `]` on a its own line
                 out.push_str("\n");
-                out.push_str(&indentation_str);
+                out.push_str(indentation_str);
                 out.push_str("}");
             }
         }
