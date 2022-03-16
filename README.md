@@ -1,5 +1,7 @@
 # goldilocks-json-fmt
 
+![crates.io](https://img.shields.io/crates/v/goldilocks-json-fmt.svg)
+
 A simple, portable, fast, pretty JSON formatter.
 
 The resulting JSON strikes a balance between 'too wide' (i.e. minified, all on one line) and 'too
