@@ -1,5 +1,7 @@
 /*!
-A simple, portable, fast, pretty JSON formatter.
+[![crates.io](https://img.shields.io/crates/v/goldilocks-json-fmt.svg)](https://crates.io/crates/goldilocks-json-fmt)
+
+A simple, portable, fast, pretty JSON formatter.  No dependencies or unsafe code.
 
 The resulting JSON strikes a balance between 'too wide' (i.e. minified, all on one line) and 'too
 tall' (e.g. `serde_json`'s `pretty_print`).  You give the formatter a line limit (defaults to 100
@@ -10,8 +12,6 @@ the formatter will break the limit by as little as possible.
 The throughput of the Goldilocks formatter is about 300MB/s, which should be enough for most
 situations.  It's about as fast as you can get without cracking out the big guns and using SIMD,
 which would break both simplicity and portability.
-
-`goldilocks_json_fmt` also has no dependencies and no unsafe code.
 
 # Example:
 
