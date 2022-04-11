@@ -87,6 +87,17 @@ pub fn format(s: &str) -> Result<String> {
     format_with_config(s, &Config::default())
 }
 
+/// Formats the given JSON with the default [`Config`]uration but a custom line length limit.
+///
+/// See [`Config::width_limit`] for an example.
+pub fn format_within_width(s: &str, width_limit: usize) -> Result<String> {
+    let config = Config {
+        width_limit,
+        ..Config::default()
+    };
+    format_with_config(s, &config)
+}
+
 /// Formats the given JSON with the given [`Config`]uration, returning an [`Error`] if the JSON
 /// wasn't valid.
 ///
